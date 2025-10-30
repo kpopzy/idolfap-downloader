@@ -1,0 +1,12 @@
+{"timestamp":"2025-08-21T07:47:10.923Z","level":"INFO","message":"[Server] 🚀 Cypress Pop API server running on port 3000","data":null}
+{"timestamp":"2025-08-21T07:47:10.930Z","level":"INFO","message":"[Server] 📊 Health check: http://localhost:3000/health","data":null}
+{"timestamp":"2025-08-21T07:47:10.944Z","level":"INFO","message":"[Server] 📥 Download endpoints:","data":null}
+{"timestamp":"2025-08-21T07:47:10.954Z","level":"INFO","message":"[Server]    - POST http://localhost:3000/download (idols)","data":null}
+{"timestamp":"2025-08-21T07:47:10.965Z","level":"INFO","message":"[Server]    - POST http://localhost:3000/download/single (single post)","data":null}
+{"timestamp":"2025-08-21T07:47:10.995Z","level":"INFO","message":"[Server]    - POST http://localhost:3000/download/creator (creators)","data":null}
+{"timestamp":"2025-08-21T07:47:11.002Z","level":"INFO","message":"[Server] 📋 Lists: GET http://localhost:3000/idols, /creators","data":null}
+{"timestamp":"2025-08-21T07:47:11.016Z","level":"INFO","message":"[Server] 📊 Status: GET http://localhost:3000/downloads/:idolName","data":null}
+{"timestamp":"2025-08-21T07:47:11.034Z","level":"INFO","message":"[Server] 🧪 Test: GET http://localhost:3000/test/browser","data":null}
+{"timestamp":"2025-08-21T07:47:11.047Z","level":"INFO","message":"[Server] 🧪 Test: GET http://localhost:3000/test/browser-simple","data":null}
+{"timestamp":"2025-08-21T07:47:11.064Z","level":"INFO","message":"[Server] 🧪 Test: GET http://localhost:3000/test/browser-ultra-simple","data":null}
+{"timestamp":"2025-08-21T07:47:11.083Z","level":"INFO","message":"[Server] 🧪 Test: GET http://localhost:3000/test/browser-alternative","data":null}
