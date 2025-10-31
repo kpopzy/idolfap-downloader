@@ -608,15 +608,36 @@ app.post('/download-creator', async (req, res) => {
         
         totalPostsProcessed++;
         const postPage = await browser.newPage();
+        await postPage.setViewport({ width: 1365, height: 768 });
+        await postPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+        await postPage.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+        postPage.setDefaultNavigationTimeout(60000);
         try {
-          await postPage.goto(postLink, { timeout: 60000 });
+          await postPage.goto(postLink, { timeout: 60000, waitUntil: 'networkidle2' });
+          
+          // Wait a bit for content to render and scroll to trigger lazy loading
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          await postPage.evaluate(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+          });
+          await new Promise(resolve => setTimeout(resolve, 1000));
 
           // First try to get images from the slider structure (EXACT match to creator.js line 57-60)
           let images = [];
           try {
+            // Wait for slider to potentially appear
+            try {
+              await postPage.waitForSelector('.post-slider-item.open-gallery img', { timeout: 5000 });
+            } catch (e) {
+              // Slider might not exist, try content links
+            }
+            
             images = await postPage.$$eval(
               '.post-slider-item.open-gallery img',
-              els => els.map(img => img.src)
+              els => els.map(img => {
+                // Try multiple sources: src, data-src, data-original
+                return img.src || img.getAttribute('data-src') || img.getAttribute('data-original') || '';
+              }).filter(src => src && src.trim() !== '')
             );
             sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Slider selector found ${images.length} images`);
         } catch (e) {
@@ -626,13 +647,50 @@ app.post('/download-creator', async (req, res) => {
           // If no images found in slider, fall back to post-content links (EXACT match to creator.js line 64-67)
           if (images.length === 0) {
             try {
+              // Wait for content to potentially appear
+              try {
+                await postPage.waitForSelector('.post-content a', { timeout: 5000 });
+              } catch (e) {
+                // Content links might not exist
+              }
+              
               images = await postPage.$$eval(
                 '.post-content a',
-                els => els.map(a => a.href)
+                els => els.map(a => a.href).filter(href => href && href.trim() !== '')
               );
               sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Content links selector found ${images.length} links`);
             } catch (e) {
               sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Content links selector error: ${e.message}`);
+            }
+          }
+          
+          // If still no images, try alternative selectors
+          if (images.length === 0) {
+            try {
+              // Debug: Check what selectors exist
+              const debugInfo = await postPage.evaluate(() => {
+                return {
+                  hasSlider: document.querySelector('.post-slider-item.open-gallery img') !== null,
+                  hasContent: document.querySelector('.post-content a') !== null,
+                  hasAnyImg: document.querySelectorAll('img').length,
+                  hasMain: document.querySelector('main') !== null,
+                  hasPostContent: document.querySelector('.post-content') !== null,
+                  bodyText: document.body.innerText.substring(0, 200)
+                };
+              });
+              sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Debug - Slider: ${debugInfo.hasSlider}, Content: ${debugInfo.hasContent}, Total imgs: ${debugInfo.hasAnyImg}, Main: ${debugInfo.hasMain}`);
+              
+              // Try all img tags in the post area
+              images = await postPage.$$eval(
+                'main img, .post-content img, article img, .post-slider img',
+                els => els.map(img => {
+                  const src = img.src || img.getAttribute('data-src') || img.getAttribute('data-original') || '';
+                  return src;
+                }).filter(src => src && src.trim() !== '' && !src.includes('data:image'))
+              );
+              sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Alternative img selector found ${images.length} images`);
+            } catch (e) {
+              sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Alternative selector error: ${e.message}`);
             }
           }
 
