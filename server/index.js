@@ -19,6 +19,47 @@ let currentJob = null;
 // SSE clients map: ip -> Set(res)
 const sseClients = new Map();
 
+// Rate limiting: IP -> { count: number, resetAt: timestamp }
+const rateLimitStore = new Map();
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const windowMs = 10 * 60 * 1000; // 10 minutes
+  const maxImages = 10;
+  
+  const record = rateLimitStore.get(ip);
+  
+  if (!record || now > record.resetAt) {
+    // Reset or new window
+    rateLimitStore.set(ip, { count: 0, resetAt: now + windowMs });
+    return { allowed: true, remaining: maxImages, resetIn: windowMs };
+  }
+  
+  if (record.count >= maxImages) {
+    const resetIn = Math.ceil((record.resetAt - now) / 1000); // seconds
+    return { allowed: false, remaining: 0, resetIn };
+  }
+  
+  return { allowed: true, remaining: maxImages - record.count - 1, resetIn: Math.ceil((record.resetAt - now) / 1000) };
+}
+
+function incrementRateLimit(ip, imageCount = 1) {
+  const record = rateLimitStore.get(ip);
+  if (record) {
+    record.count += imageCount;
+  }
+}
+
+// Cleanup old rate limit records every 15 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitStore.entries()) {
+    if (now > record.resetAt) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, 15 * 60 * 1000);
+
 function addSseClient(ip, res) {
   if (!sseClients.has(ip)) sseClients.set(ip, new Set());
   sseClients.get(ip).add(res);
@@ -267,8 +308,31 @@ app.post('/download', async (req, res) => {
   if (currentJob) {
     return res.status(409).json({ error: 'A download job is already running' });
   }
+  
+  const clientIP = sanitizeIP(getClientIP(req));
+  const rateLimit = checkRateLimit(clientIP);
+  if (!rateLimit.allowed) {
+    const minutes = Math.floor(rateLimit.resetIn / 60);
+    const seconds = rateLimit.resetIn % 60;
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded',
+      message: `You have reached the limit of 10 images per 10 minutes. Please try again in ${minutes}m ${seconds}s.`,
+      resetIn: rateLimit.resetIn
+    });
+  }
+  
+  // Estimate images: assume ~15 images per page
+  const estimatedImages = (parseInt(end) - parseInt(start) + 1) * 15;
+  if (estimatedImages > rateLimit.remaining) {
+    return res.status(429).json({ 
+      error: 'Rate limit would be exceeded',
+      message: `This request would download approximately ${estimatedImages} images, but you only have ${rateLimit.remaining} remaining in this 10-minute window.`,
+      remaining: rateLimit.remaining,
+      resetIn: rateLimit.resetIn
+    });
+  }
+  
   try {
-    const clientIP = sanitizeIP(getClientIP(req));
     const userDownloadsDir = path.join(downloadsDir, clientIP);
     currentJob = {
       browser: null,
@@ -293,6 +357,8 @@ app.post('/download', async (req, res) => {
       sendLog(clientIP, `[${new Date().toISOString()}] Job cancelled by user`);
       res.status(499).json({ status: 'cancelled', idol, start: Number(start), end: Number(end) });
     } else {
+      // Increment rate limit by estimated count (we already checked it won't exceed)
+      incrementRateLimit(clientIP, estimatedImages);
       res.json({ status: 'completed', idol, start: Number(start), end: Number(end) });
     }
   } catch (err) {
@@ -329,8 +395,31 @@ app.post('/download-post', async (req, res) => {
   if (!idol || !postUrl) {
     return res.status(400).json({ error: 'idol and postUrl are required' });
   }
+  
+  const clientIP = sanitizeIP(getClientIP(req));
+  const rateLimit = checkRateLimit(clientIP);
+  if (!rateLimit.allowed) {
+    const minutes = Math.floor(rateLimit.resetIn / 60);
+    const seconds = rateLimit.resetIn % 60;
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded',
+      message: `You have reached the limit of 10 images per 10 minutes. Please try again in ${minutes}m ${seconds}s.`,
+      resetIn: rateLimit.resetIn
+    });
+  }
+  
+  if (currentJob) {
+    return res.status(409).json({ error: 'A download job is already running' });
+  }
+  
+  currentJob = {
+    browser: null,
+    abort: { value: false },
+    clientIP,
+    type: 'post'
+  };
+  
   try {
-    const clientIP = sanitizeIP(getClientIP(req));
     const targetDir = path.join(downloadsDir, clientIP, String(idol));
     fs.mkdirSync(targetDir, { recursive: true });
 
@@ -342,6 +431,7 @@ app.post('/download-post', async (req, res) => {
       executablePath,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
     });
+    currentJob.browser = browser;
     const page = await browser.newPage();
     await page.setViewport({ width: 1365, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
@@ -384,6 +474,11 @@ app.post('/download-post', async (req, res) => {
     const saved = [];
     const skipped = [];
     for (const imageUrl of imageCandidates) {
+      if (currentJob?.abort?.value) {
+        sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled by user`);
+        break;
+      }
+      
       const rawName = decodeURIComponent((new URL(imageUrl)).pathname.split('/').pop() || 'file');
       let filename = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
       let savePath = path.join(targetDir, filename);
@@ -406,9 +501,23 @@ app.post('/download-post', async (req, res) => {
     await page.close();
     await browser.close();
 
-    return res.json({ status: 'completed', idol, postUrl, savedCount: saved.length, skippedCount: skipped.length, saved, skipped });
+    // Increment rate limit with actual saved count
+    incrementRateLimit(clientIP, saved.length);
+
+    if (currentJob?.abort?.value) {
+      res.status(499).json({ status: 'cancelled', idol, postUrl, savedCount: saved.length, skippedCount: skipped.length });
+    } else {
+      res.json({ status: 'completed', idol, postUrl, savedCount: saved.length, skippedCount: skipped.length, saved, skipped });
+    }
   } catch (err) {
-    return res.status(500).json({ error: err?.message || String(err) });
+    if (err.message === 'Cancelled' || currentJob?.abort?.value) {
+      sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled: ${err.message}`);
+      res.status(499).json({ status: 'cancelled', error: 'Download was cancelled' });
+    } else {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
+  } finally {
+    currentJob = null;
   }
 });
 
@@ -421,8 +530,31 @@ app.post('/download-creator', async (req, res) => {
   }
   const startPage = Math.max(1, parseInt(start));
   const endPage = Math.max(startPage, parseInt(end));
+  
+  const clientIP = sanitizeIP(getClientIP(req));
+  const rateLimit = checkRateLimit(clientIP);
+  if (!rateLimit.allowed) {
+    const minutes = Math.floor(rateLimit.resetIn / 60);
+    const seconds = rateLimit.resetIn % 60;
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded',
+      message: `You have reached the limit of 10 images per 10 minutes. Please try again in ${minutes}m ${seconds}s.`,
+      resetIn: rateLimit.resetIn
+    });
+  }
+  
+  if (currentJob) {
+    return res.status(409).json({ error: 'A download job is already running' });
+  }
+  
+  currentJob = {
+    browser: null,
+    abort: { value: false },
+    clientIP,
+    type: 'creator'
+  };
+  
   try {
-    const clientIP = sanitizeIP(getClientIP(req));
     const targetDir = path.join(downloadsDir, clientIP, String(creator));
     fs.mkdirSync(targetDir, { recursive: true });
 
@@ -433,6 +565,7 @@ app.post('/download-creator', async (req, res) => {
       executablePath,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
     });
+    currentJob.browser = browser;
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1365, height: 768 });
@@ -443,6 +576,11 @@ app.post('/download-creator', async (req, res) => {
     let totalPostsProcessed = 0;
     let totalSaved = 0;
     for (let pageNumber = startPage; pageNumber <= endPage; pageNumber++) {
+      if (currentJob?.abort?.value) {
+        sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled by user`);
+        break;
+      }
+      
       const pageUrl = pageNumber === 1
         ? `https://idolfap.com/creator/${encodeURIComponent(creator)}/`
         : `https://idolfap.com/creator/${encodeURIComponent(creator)}/page/${pageNumber}/`;
@@ -463,6 +601,11 @@ app.post('/download-creator', async (req, res) => {
       sendLog(clientIP, `[${new Date().toISOString()}] Found ${postLinks.length} posts on page ${pageNumber}`);
 
       for (const postLink of postLinks) {
+        if (currentJob?.abort?.value) {
+          sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled by user`);
+          break;
+        }
+        
         totalPostsProcessed++;
         const postPage = await browser.newPage();
         try {
@@ -475,10 +618,8 @@ app.post('/download-creator', async (req, res) => {
               '.post-slider-item.open-gallery img',
               els => els.map(img => img.src)
             );
-            console.log(1)
             sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Slider selector found ${images.length} images`);
         } catch (e) {
-              console.log(2)
             sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Slider selector error: ${e.message}`);
           }
 
@@ -498,6 +639,11 @@ app.post('/download-creator', async (req, res) => {
           sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Found ${images.length} images (${creator}) on post ${totalPostsProcessed}: ${postLink}`);
 
           for (const imageUrl of images) {
+            if (currentJob?.abort?.value) {
+              sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled by user`);
+              break;
+            }
+            
             const filename = path.basename(new URL(imageUrl).pathname);
             const savePath = path.join(targetDir, filename);
 
@@ -537,9 +683,24 @@ app.post('/download-creator', async (req, res) => {
 
     await page.close();
     await browser.close();
-    return res.json({ status: 'completed', creator, start: startPage, end: endPage, postsProcessed: totalPostsProcessed, saved: totalSaved });
+    
+    // Increment rate limit with actual saved count
+    incrementRateLimit(clientIP, totalSaved);
+    
+    if (currentJob?.abort?.value) {
+      res.status(499).json({ status: 'cancelled', creator, start: startPage, end: endPage, postsProcessed: totalPostsProcessed, saved: totalSaved });
+    } else {
+      res.json({ status: 'completed', creator, start: startPage, end: endPage, postsProcessed: totalPostsProcessed, saved: totalSaved });
+    }
   } catch (err) {
-    return res.status(500).json({ error: err?.message || String(err) });
+    if (err.message === 'Cancelled' || currentJob?.abort?.value) {
+      sendLog(clientIP, `[${new Date().toISOString()}] Download cancelled: ${err.message}`);
+      res.status(499).json({ status: 'cancelled', error: 'Download was cancelled' });
+    } else {
+      res.status(500).json({ error: err?.message || String(err) });
+    }
+  } finally {
+    currentJob = null;
   }
 });
 
