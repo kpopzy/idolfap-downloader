@@ -153,21 +153,85 @@ app.get('/api/files/:idol', (req, res) => {
   }
 });
 
-// Serve files inline for preview (IP-based)
-app.get('/files/:idol/:filename', (req, res) => {
+// Download all files for an idol/creator as ZIP (IP-based) - MUST be before /files/:idol/:filename
+app.get('/files/download-zip/:idol', (req, res) => {
+  console.log(`[ZIP] Route hit! Params:`, req.params);
   try {
-    const clientIP = sanitizeIP(getClientIP(req));
-    const filePath = path.join(downloadsDir, clientIP, req.params.idol, req.params.filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: 'File not found' });
+    const rawIP = getClientIP(req);
+    const clientIP = sanitizeIP(rawIP);
+    const idolDir = path.join(downloadsDir, clientIP, req.params.idol);
+    
+    console.log(`[ZIP] Raw IP: ${rawIP}, Sanitized: ${clientIP}, Path: ${idolDir}`);
+    
+    // List available directories to help debug
+    const userDownloadsDir = path.join(downloadsDir, clientIP);
+    const availableDirs = fs.existsSync(userDownloadsDir) 
+      ? fs.readdirSync(userDownloadsDir, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => d.name)
+      : [];
+    
+    // If folder doesn't exist, try to find it in any IP folder (for localhost variations)
+    let actualIdolDir = idolDir;
+    if (!fs.existsSync(idolDir)) {
+      console.log(`[ZIP] Folder not found at ${idolDir}, searching in downloads directory...`);
+      if (fs.existsSync(downloadsDir)) {
+        const ipDirs = fs.readdirSync(downloadsDir, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => d.name);
+        console.log(`[ZIP] Found IP directories: ${ipDirs.join(', ')}`);
+        
+        for (const ipDir of ipDirs) {
+          const checkPath = path.join(downloadsDir, ipDir, req.params.idol);
+          if (fs.existsSync(checkPath)) {
+            console.log(`[ZIP] Found folder at: ${checkPath}`);
+            actualIdolDir = checkPath;
+            break;
+          }
+        }
+      }
+      
+      if (!fs.existsSync(actualIdolDir)) {
+        return res.status(404).json({ 
+          error: 'Folder not found', 
+          path: idolDir,
+          searchedPath: actualIdolDir,
+          rawIP: rawIP,
+          sanitizedIP: clientIP,
+          availableFolders: availableDirs,
+          userDownloadsDir: userDownloadsDir,
+          allIPDirs: fs.existsSync(downloadsDir) ? fs.readdirSync(downloadsDir, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => d.name) : []
+        });
+      }
     }
-    res.sendFile(filePath);
+
+    // Check if directory is actually a directory and not empty
+    const files = fs.readdirSync(actualIdolDir);
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'Folder is empty' });
+    }
+
+    const zipName = `${req.params.idol}.zip`;
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', err => {
+      console.error('Archive error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+    archive.pipe(res);
+    archive.directory(actualIdolDir, false);
+    archive.finalize();
   } catch (err) {
+    console.error('ZIP download error:', err);
     res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
-// Force download (IP-based)
+// Force download (IP-based) - MUST be before /files/:idol/:filename
 app.get('/files/download/:idol/:filename', (req, res) => {
   try {
     const clientIP = sanitizeIP(getClientIP(req));
@@ -181,24 +245,15 @@ app.get('/files/download/:idol/:filename', (req, res) => {
   }
 });
 
-// Download all files for an idol as ZIP (IP-based)
-app.get('/files/download-zip/:idol', (req, res) => {
+// Serve files inline for preview (IP-based) - MUST be last (most general pattern)
+app.get('/files/:idol/:filename', (req, res) => {
   try {
     const clientIP = sanitizeIP(getClientIP(req));
-    const idolDir = path.join(downloadsDir, clientIP, req.params.idol);
-    if (!fs.existsSync(idolDir)) {
-      return res.status(404).json({ error: 'Idol folder not found' });
+    const filePath = path.join(downloadsDir, clientIP, req.params.idol, req.params.filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
     }
-
-    const zipName = `${req.params.idol}.zip`;
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
-
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('error', err => res.status(500).end(err.message));
-    archive.pipe(res);
-    archive.directory(idolDir, false);
-    archive.finalize();
+    res.sendFile(filePath);
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -359,6 +414,7 @@ app.post('/download-post', async (req, res) => {
 
 // Download images from a creator's pages (range) into the user's IP + creator folder
 app.post('/download-creator', async (req, res) => {
+    console.log('/download-creator')
   const { creator, start = 1, end = 1 } = req.body || {};
   if (!creator) {
     return res.status(400).json({ error: 'creator is required' });
@@ -382,7 +438,7 @@ app.post('/download-creator', async (req, res) => {
     await page.setViewport({ width: 1365, height: 768 });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
-    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultNavigationTimeout(100000);
 
     let totalPostsProcessed = 0;
     let totalSaved = 0;
@@ -410,57 +466,65 @@ app.post('/download-creator', async (req, res) => {
         totalPostsProcessed++;
         const postPage = await browser.newPage();
         try {
-          await postPage.goto(postLink, { waitUntil: 'domcontentloaded', timeout: 60000 });
-          try { await postPage.waitForSelector('.post-slider-item, .post-content', { timeout: 5000 }); } catch {}
-          const pageUrl = postPage.url();
-          let imageCandidates = await postPage.$$eval(
-            '.post-slider-item.open-gallery img, .post-content img, .post-content a',
-            (els, baseUrl) => {
-              const urls = [];
-              els.forEach((el) => {
-                const tag = (el.tagName || '').toUpperCase();
-                if (tag === 'A') {
-                  const href = el.getAttribute('href') || '';
-                  if (/(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(href)) {
-                    try {
-                      const abs = href.startsWith('http') ? href : new URL(href, baseUrl).href;
-                      urls.push(abs);
-                    } catch { urls.push(href); }
-                  }
-                } else if (tag === 'IMG') {
-                  const src = el.getAttribute('src') || el.getAttribute('data-src') || el.getAttribute('data-original') || '';
-                  if (src) {
-                    try {
-                      const abs = src.startsWith('http') ? src : new URL(src, baseUrl).href;
-                      urls.push(abs);
-                    } catch { urls.push(src); }
-                  }
-                }
-              });
-              return Array.from(new Set(urls));
-            },
-            pageUrl
-          ).catch(() => []);
-          imageCandidates = imageCandidates.filter(u => /(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(u));
-          sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Images: ${imageCandidates.length} - ${postLink}`);
-          for (const imageUrl of imageCandidates) {
-            const raw = decodeURIComponent((new URL(imageUrl)).pathname.split('/').pop() || 'file');
-            const filename = raw.replace(/[^a-zA-Z0-9._-]/g, '_');
+          await postPage.goto(postLink, { timeout: 60000 });
+
+          // First try to get images from the slider structure (EXACT match to creator.js line 57-60)
+          let images = [];
+          try {
+            images = await postPage.$$eval(
+              '.post-slider-item.open-gallery img',
+              els => els.map(img => img.src)
+            );
+            console.log(1)
+            sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Slider selector found ${images.length} images`);
+        } catch (e) {
+              console.log(2)
+            sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Slider selector error: ${e.message}`);
+          }
+
+          // If no images found in slider, fall back to post-content links (EXACT match to creator.js line 64-67)
+          if (images.length === 0) {
+            try {
+              images = await postPage.$$eval(
+                '.post-content a',
+                els => els.map(a => a.href)
+              );
+              sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Content links selector found ${images.length} links`);
+            } catch (e) {
+              sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Content links selector error: ${e.message}`);
+            }
+          }
+
+          sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Found ${images.length} images (${creator}) on post ${totalPostsProcessed}: ${postLink}`);
+
+          for (const imageUrl of images) {
+            const filename = path.basename(new URL(imageUrl).pathname);
             const savePath = path.join(targetDir, filename);
+
+            // Skip if already exists (matching creator.js)
             try {
               await fs.promises.access(savePath);
-              sendLog(clientIP, `[${new Date().toISOString()}] Skip exists: ${filename}`);
+              sendLog(clientIP, `[${new Date().toISOString()}] ✓ Skipping ${filename}, already exists.`);
               continue;
             } catch {}
+
+            sendLog(clientIP, `[${new Date().toISOString()}] Downloading (${creator}) [post ${totalPostsProcessed}] : ${imageUrl}`);
             try {
-              const resp = await postPage.goto(imageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
-              if (!resp) throw new Error('No response');
-              const buf = await resp.buffer();
-              await fs.promises.writeFile(savePath, buf);
+              const response = await postPage.goto(imageUrl, {
+                timeout: 60000,
+                waitUntil: 'networkidle2'
+              });
+
+              if (!response) {
+                throw new Error('No response from image URL');
+              }
+
+              const buffer = await response.buffer();
+              await fs.promises.writeFile(savePath, buffer);
               totalSaved++;
-              sendLog(clientIP, `[${new Date().toISOString()}] Saved: ${filename}`);
-            } catch (e) {
-              sendLog(clientIP, `[${new Date().toISOString()}] Failed ${filename}: ${e.message}`);
+              sendLog(clientIP, `[${new Date().toISOString()}] ✓ Saved (${creator}) ${filename}`);
+            } catch (err) {
+              sendLog(clientIP, `[${new Date().toISOString()}] ✗ Failed ${filename}: ${err.message}`);
             }
           }
         } catch (err) {
