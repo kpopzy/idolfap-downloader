@@ -28,7 +28,8 @@ RUN apt-get update && \
 
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium \
     NODE_ENV=production \
-    PORT=5000
+    PORT=5000 \
+    HEADLESS=true
 
 WORKDIR /app
 COPY package*.json ./

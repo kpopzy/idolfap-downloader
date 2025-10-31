@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Idol Downloader</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" crossorigin="anonymous">
+    <style>
+      .log { background:#111; color:#0f0; padding:1rem; height: 300px; overflow-y: auto; white-space: pre-wrap; font-family: 'Courier New', monospace; font-size: 0.875rem; border-radius: 0.375rem; }
+    </style>
+  </head>
+  <body>
+    <div class="container my-4">
+      <nav class="mb-4">
+        <a href="/gallery" class="btn btn-outline-primary">View Gallery →</a>
+      </nav>
+      
+      <h1 class="mb-4">Idol Downloader</h1>
+      
+      <div class="card">
+        <div class="card-body">
+          <form id="f">
+            <div class="mb-3">
+              <label for="idol" class="form-label">Idol</label>
+              <input type="text" class="form-control" id="idol" name="idol" required placeholder="kazuha" />
+            </div>
+            <div class="mb-3">
+              <label for="start" class="form-label">Start Page</label>
+              <input type="number" class="form-control" id="start" name="start" min="1" value="1" required />
+            </div>
+            <div class="mb-3">
+              <label for="end" class="form-label">End Page</label>
+              <input type="number" class="form-control" id="end" name="end" min="1" value="2" required />
+            </div>
+            <div class="btn-group" role="group">
+              <button type="submit" class="btn btn-primary" id="downloadBtn">Download</button>
+              <button type="button" class="btn btn-danger" id="stopBtn" style="display:none">Stop</button>
+            </div>
+          </form>
+        </div>
+      </div>
+      
+      <div class="card mt-4">
+        <div class="card-header">
+          <h5 class="mb-0">Logs</h5>
+        </div>
+        <div class="card-body p-0">
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
+    <script>
+      const form = document.getElementById('f');
+      const log = document.getElementById('log');
+      const downloadBtn = document.getElementById('downloadBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      let es;
+      let isRunning = false;
+      
+      function openStream(){
+        if (es) es.close();
+        es = new EventSource('/logs');
+        es.onmessage = (e) => { log.textContent += e.data + '\n'; log.scrollTop = log.scrollHeight; };
+        es.onerror = () => { /* ignore transient errors */ };
+      }
+      openStream();
+
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (isRunning) return;
+        const data = Object.fromEntries(new FormData(form).entries());
+        data.start = Number(data.start);
+        data.end = Number(data.end);
+        log.textContent = 'Submitting...\n';
+        isRunning = true;
+        downloadBtn.disabled = true;
+        stopBtn.style.display = 'inline-block';
+        
+        try {
+          const res = await fetch('/download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(data)
+          });
+          const json = await res.json();
+          log.textContent += JSON.stringify(json, null, 2) + '\n';
+        } catch (err) {
+          log.textContent += 'Error: ' + err.message + '\n';
+        } finally {
+          isRunning = false;
+          downloadBtn.disabled = false;
+          stopBtn.style.display = 'none';
+        }
+      });
+
+      stopBtn.addEventListener('click', async () => {
+        try {
+          const res = await fetch('/stop', { method: 'POST' });
+          const json = await res.json();
+          log.textContent += '[Stop] ' + JSON.stringify(json) + '\n';
+        } catch (err) {
+          log.textContent += '[Stop Error] ' + err.message + '\n';
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -58,10 +58,12 @@ function resolveProxyForWSL() {
   }
 }
 
-export async function runDownload(idolName, start, end) {
+export async function runDownload(idolName, start, end, onLog, onBrowserReady, shouldAbort, customDownloadDir) {
 function logStep(msg) {
   const ts = new Date().toISOString();
-  console.log(`[${ts}] ${msg}`);
+  const line = `[${ts}] ${msg}`;
+  console.log(line);
+  try { if (typeof onLog === 'function') onLog(line); } catch {}
 }
 
 logStep('Starting...')
@@ -72,7 +74,8 @@ logStep(`Range: ${start}..${end}`)
     process.exit(1);
   }
 
-  const downloadDir = path.resolve('./downloads/' + idolName);
+  const baseDownloadDir = customDownloadDir || path.resolve('./downloads');
+  const downloadDir = path.join(baseDownloadDir, idolName);
   fs.mkdirSync(downloadDir, { recursive: true });
 
   // Resolve browser executable in this order:
@@ -85,28 +88,36 @@ logStep(`Range: ${start}..${end}`)
   } catch {}
   if (!executablePath) executablePath = resolveChromeExecutablePath();
   if (!executablePath) {
-    console.error('❌ No Chrome/Chromium executable found.');
-    console.error('Fix one of these:');
-    console.error('  - Download Puppeteer browser: npx puppeteer browsers install chrome');
-    console.error('  - Or install system Chromium: sudo apt-get update && sudo apt-get install -y chromium || sudo apt-get install -y chromium-browser');
-    console.error('  - Or set PUPPETEER_EXECUTABLE_PATH to your Chrome path.');
+    const lines = [
+      '❌ No Chrome/Chromium executable found.',
+      'Fix one of these:',
+      '  - Download Puppeteer browser: npx puppeteer browsers install chrome',
+      '  - Or install system Chromium: sudo apt-get update && sudo apt-get install -y chromium || sudo apt-get install -y chromium-browser',
+      '  - Or set PUPPETEER_EXECUTABLE_PATH to your Chrome path.'
+    ];
+    lines.forEach(l => { console.error(l); try { if (onLog) onLog(l); } catch {} });
     process.exit(1);
   }
 
   logStep('Launching browser...')
   const proxyServer = resolveProxyForWSL();
+  const headlessMode = process.env.HEADLESS !== 'false';
+  logStep(`Headless mode: ${headlessMode ? 'enabled' : 'disabled'}`);
   const launchArgs = [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-gpu',
       '--disable-dev-shm-usage',
-      '--no-zygote',
       '--disable-software-rasterizer',
       '--disable-features=VizDisplayCompositor',
       '--disable-blink-features=AutomationControlled',
-      '--window-size=1365,768',
-      '--start-maximized'
+      '--disable-extensions'
   ];
+  
+  if (!headlessMode) {
+    launchArgs.push('--window-size=1365,768', '--start-maximized', '--no-zygote');
+  }
+  
   if (proxyServer) {
     launchArgs.push(`--proxy-server=${proxyServer}`);
     logStep(`Using proxy: ${proxyServer}`);
@@ -125,11 +136,14 @@ logStep(`Range: ${start}..${end}`)
     browser = await puppeteer.connect({ browserURL, defaultViewport: null });
   } else {
     browser = await puppeteer.launch({
-      headless: false,
+      headless: headlessMode ? 'new' : false,
       args: launchArgs,
       ignoreDefaultArgs: ['--enable-automation'],
       executablePath
     });
+  }
+  if (typeof onBrowserReady === 'function') {
+    onBrowserReady(browser);
   }
   logStep('Creating main page...')
   let page = await browser.newPage();
@@ -183,6 +197,10 @@ logStep(`Range: ${start}..${end}`)
   }
 
   for (let index = start; index <= end; index++) {
+    if (shouldAbort && shouldAbort()) {
+      await browser.close();
+      throw new Error('Cancelled');
+    }
     try {
       logStep(`Processing listing page index=${index}`);
       await gotoWithRetry(page, `https://idolfap.com/idols/${idolName}/page/${index}/`);
@@ -195,6 +213,10 @@ logStep(`Range: ${start}..${end}`)
       logStep(`Found ${postLinks.length} post links on index=${index}`);
 
       for (let postLink of postLinks) {
+        if (shouldAbort && shouldAbort()) {
+          await browser.close();
+          throw new Error('Cancelled');
+        }
         logStep(`Opening post: ${postLink}`);
         const postPage = await browser.newPage();
         await postPage.setViewport({ width: 1365, height: 768 });
