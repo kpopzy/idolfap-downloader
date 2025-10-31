@@ -71,15 +71,32 @@ app.get('/logs', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
   res.flushHeaders?.();
 
   addSseClient(ip, res);
-  // greet
+  // greet (only once)
   sendLog(ip, `[${new Date().toISOString()}] Connected to logs (IP ${ip})`);
 
+  // Keepalive ping every 30 seconds to prevent timeout
+  const pingInterval = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch (err) {
+      clearInterval(pingInterval);
+      removeSseClient(ip, res);
+    }
+  }, 30000);
+
   req.on('close', () => {
+    clearInterval(pingInterval);
     removeSseClient(ip, res);
     res.end();
+  });
+
+  req.on('error', () => {
+    clearInterval(pingInterval);
+    removeSseClient(ip, res);
   });
 });
 
@@ -277,14 +294,38 @@ app.post('/download-post', async (req, res) => {
     page.setDefaultNavigationTimeout(30000);
 
     await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
+    try { await page.waitForSelector('.post-slider-item, .post-content', { timeout: 5000 }); } catch {}
 
-    // Try to grab slider images first, fallback to content links
-    let images = await page.$$eval('.post-slider-item.open-gallery img', els => els.map(img => img.src));
-    if (!images || images.length === 0) {
-      images = await page.$$eval('.post-content a', els => els.map(a => a.href));
-    }
-
-    const imageCandidates = images.filter(u => /\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i.test(u));
+    // Collect image candidates from multiple selectors (supports lazy attrs)
+    let imageCandidates = await page.$$eval(
+      '.post-slider-item.open-gallery img, .post-content img, .post-content a',
+      (els, baseUrl) => {
+        const urls = [];
+        els.forEach((el) => {
+          const tag = (el.tagName || '').toUpperCase();
+          if (tag === 'A') {
+            const href = el.getAttribute('href') || '';
+            if (/\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i.test(href)) {
+              try {
+                const abs = href.startsWith('http') ? href : new URL(href, baseUrl).href;
+                urls.push(abs);
+              } catch { urls.push(href); }
+            }
+          } else if (tag === 'IMG') {
+            const src = el.getAttribute('src') || el.getAttribute('data-src') || el.getAttribute('data-original') || '';
+            if (src) {
+              try {
+                const abs = src.startsWith('http') ? src : new URL(src, baseUrl).href;
+                urls.push(abs);
+              } catch { urls.push(src); }
+            }
+          }
+        });
+        return Array.from(new Set(urls));
+      },
+      postUrl
+    ).catch(() => []);
+    imageCandidates = imageCandidates.filter(u => /\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i.test(u));
     const saved = [];
     const skipped = [];
     for (const imageUrl of imageCandidates) {
@@ -296,8 +337,10 @@ app.post('/download-post', async (req, res) => {
         continue;
       }
       try {
-        const resp = await axios.get(imageUrl, { responseType: 'arraybuffer', headers: { Referer: postUrl, 'User-Agent': 'Mozilla/5.0' }, timeout: 60000 });
-        await fs.promises.writeFile(savePath, Buffer.from(resp.data));
+        const resp = await page.goto(imageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+        if (!resp) throw new Error('No response');
+        const buf = await resp.buffer();
+        await fs.promises.writeFile(savePath, buf);
         saved.push(filename);
         sendLog(clientIP, `[${new Date().toISOString()}] Saved from post: ${filename}`);
       } catch (e) {
@@ -368,11 +411,37 @@ app.post('/download-creator', async (req, res) => {
         const postPage = await browser.newPage();
         try {
           await postPage.goto(postLink, { waitUntil: 'domcontentloaded', timeout: 60000 });
-          let images = await postPage.$$eval('.post-slider-item.open-gallery img', els => els.map(img => img.src));
-          if (!images || images.length === 0) {
-            images = await postPage.$$eval('.post-content a', els => els.map(a => a.href));
-          }
-          const imageCandidates = images.filter(u => /(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(u));
+          try { await postPage.waitForSelector('.post-slider-item, .post-content', { timeout: 5000 }); } catch {}
+          const pageUrl = postPage.url();
+          let imageCandidates = await postPage.$$eval(
+            '.post-slider-item.open-gallery img, .post-content img, .post-content a',
+            (els, baseUrl) => {
+              const urls = [];
+              els.forEach((el) => {
+                const tag = (el.tagName || '').toUpperCase();
+                if (tag === 'A') {
+                  const href = el.getAttribute('href') || '';
+                  if (/(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(href)) {
+                    try {
+                      const abs = href.startsWith('http') ? href : new URL(href, baseUrl).href;
+                      urls.push(abs);
+                    } catch { urls.push(href); }
+                  }
+                } else if (tag === 'IMG') {
+                  const src = el.getAttribute('src') || el.getAttribute('data-src') || el.getAttribute('data-original') || '';
+                  if (src) {
+                    try {
+                      const abs = src.startsWith('http') ? src : new URL(src, baseUrl).href;
+                      urls.push(abs);
+                    } catch { urls.push(src); }
+                  }
+                }
+              });
+              return Array.from(new Set(urls));
+            },
+            pageUrl
+          ).catch(() => []);
+          imageCandidates = imageCandidates.filter(u => /(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(u));
           sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Images: ${imageCandidates.length} - ${postLink}`);
           for (const imageUrl of imageCandidates) {
             const raw = decodeURIComponent((new URL(imageUrl)).pathname.split('/').pop() || 'file');
@@ -384,8 +453,10 @@ app.post('/download-creator', async (req, res) => {
               continue;
             } catch {}
             try {
-              const resp = await axios.get(imageUrl, { responseType: 'arraybuffer', headers: { Referer: postLink, 'User-Agent': 'Mozilla/5.0' }, timeout: 60000 });
-              await fs.promises.writeFile(savePath, Buffer.from(resp.data));
+              const resp = await postPage.goto(imageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+              if (!resp) throw new Error('No response');
+              const buf = await resp.buffer();
+              await fs.promises.writeFile(savePath, buf);
               totalSaved++;
               sendLog(clientIP, `[${new Date().toISOString()}] Saved: ${filename}`);
             } catch (e) {

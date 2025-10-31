@@ -170,11 +170,24 @@
       let es;
       let isRunning = false;
       
+      let hasShownConnectMessage = false;
       function openStream(){
         if (es) es.close();
         es = new EventSource('/logs');
-        es.onmessage = (e) => { log.textContent += e.data + '\n'; log.scrollTop = log.scrollHeight; };
-        es.onerror = () => { /* ignore transient errors */ };
+        es.onmessage = (e) => {
+          // Skip ping messages
+          if (e.data.trim() === ': ping') return;
+          // Only show first connect message, suppress reconnects
+          if (e.data.includes('Connected to logs')) {
+            if (hasShownConnectMessage) return;
+            hasShownConnectMessage = true;
+          }
+          log.textContent += e.data + '\n';
+          log.scrollTop = log.scrollHeight;
+        };
+        es.onerror = () => {
+          // EventSource auto-reconnects, suppress duplicate connect messages
+        };
       }
       openStream();
 
