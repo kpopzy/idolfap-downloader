@@ -3,7 +3,9 @@ import bodyParser from 'body-parser';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { EventEmitter } from 'events';
+import archiver from 'archiver';
+import axios from 'axios';
+// removed pipelinePromise (no longer needed)
 import { runDownload } from '../main.js';
 
 const app = express();
@@ -13,8 +15,30 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, '..', 'public');
 const downloadsDir = path.join(__dirname, '..', 'downloads');
-const logEmitter = new EventEmitter();
 let currentJob = null;
+// SSE clients map: ip -> Set(res)
+const sseClients = new Map();
+
+function addSseClient(ip, res) {
+  if (!sseClients.has(ip)) sseClients.set(ip, new Set());
+  sseClients.get(ip).add(res);
+}
+
+function removeSseClient(ip, res) {
+  const set = sseClients.get(ip);
+  if (set) {
+    set.delete(res);
+    if (set.size === 0) sseClients.delete(ip);
+  }
+}
+
+function sendLog(ip, message) {
+  const set = sseClients.get(ip);
+  if (!set) return;
+  for (const res of set) {
+    try { res.write(`data: ${message}\n\n`); } catch {}
+  }
+}
 
 // Get client IP address (handles proxies)
 function getClientIP(req) {
@@ -41,20 +65,20 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
 
-// Server-Sent Events for live logs
+// Server-Sent Events for live logs (IP-scoped)
 app.get('/logs', (req, res) => {
+  const ip = sanitizeIP(getClientIP(req));
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  const onLog = (msg) => {
-    res.write(`data: ${msg}\n\n`);
-  };
-  logEmitter.on('log', onLog);
+  addSseClient(ip, res);
+  // greet
+  sendLog(ip, `[${new Date().toISOString()}] Connected to logs (IP ${ip})`);
 
   req.on('close', () => {
-    logEmitter.off('log', onLog);
+    removeSseClient(ip, res);
     res.end();
   });
 });
@@ -84,22 +108,29 @@ app.get('/api/idols', (req, res) => {
   }
 });
 
-// List files for an idol (IP-based)
+// List files for an idol (IP-based) with pagination
 app.get('/api/files/:idol', (req, res) => {
   try {
     const clientIP = sanitizeIP(getClientIP(req));
     const idolDir = path.join(downloadsDir, clientIP, req.params.idol);
     if (!fs.existsSync(idolDir)) {
-      return res.json([]);
+      return res.json({ files: [], total: 0, hasMore: false });
     }
-    const files = fs.readdirSync(idolDir, { withFileTypes: true })
+    const allFiles = fs.readdirSync(idolDir, { withFileTypes: true })
       .filter(dirent => dirent.isFile())
       .map(dirent => ({
         name: dirent.name,
         path: `/files/${req.params.idol}/${dirent.name}`,
         size: fs.statSync(path.join(idolDir, dirent.name)).size
-      }));
-    res.json(files);
+      }))
+      .sort((a, b) => b.name.localeCompare(a.name)); // Sort by name descending
+    
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+    const files = allFiles.slice(offset, offset + limit);
+    const hasMore = offset + limit < allFiles.length;
+    
+    res.json({ files, total: allFiles.length, hasMore, offset, limit });
   } catch (err) {
     res.status(500).json({ error: err?.message || String(err) });
   }
@@ -133,6 +164,29 @@ app.get('/files/download/:idol/:filename', (req, res) => {
   }
 });
 
+// Download all files for an idol as ZIP (IP-based)
+app.get('/files/download-zip/:idol', (req, res) => {
+  try {
+    const clientIP = sanitizeIP(getClientIP(req));
+    const idolDir = path.join(downloadsDir, clientIP, req.params.idol);
+    if (!fs.existsSync(idolDir)) {
+      return res.status(404).json({ error: 'Idol folder not found' });
+    }
+
+    const zipName = `${req.params.idol}.zip`;
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('error', err => res.status(500).end(err.message));
+    archive.pipe(res);
+    archive.directory(idolDir, false);
+    archive.finalize();
+  } catch (err) {
+    res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
 app.post('/download', async (req, res) => {
   const { idol, start, end } = req.body || {};
   if (!idol || !start || !end) {
@@ -151,27 +205,27 @@ app.post('/download', async (req, res) => {
     };
     
     // Emit a header line
-    logEmitter.emit('log', `[${new Date().toISOString()}] Starting job idol=${idol} start=${start} end=${end} (IP: ${clientIP})`);
+    sendLog(clientIP, `[${new Date().toISOString()}] Starting job idol=${idol} start=${start} end=${end} (IP: ${clientIP})`);
     
     await runDownload(
       String(idol), 
       parseInt(start), 
       parseInt(end), 
-      (line) => logEmitter.emit('log', line),
+      (line) => sendLog(clientIP, line),
       (browser) => { currentJob.browser = browser; },
       () => currentJob.abort.value,
       userDownloadsDir
     );
     
     if (currentJob.abort.value) {
-      logEmitter.emit('log', `[${new Date().toISOString()}] Job cancelled by user`);
+      sendLog(clientIP, `[${new Date().toISOString()}] Job cancelled by user`);
       res.status(499).json({ status: 'cancelled', idol, start: Number(start), end: Number(end) });
     } else {
       res.json({ status: 'completed', idol, start: Number(start), end: Number(end) });
     }
   } catch (err) {
     if (err.message === 'Cancelled' || currentJob?.abort?.value) {
-      logEmitter.emit('log', `[${new Date().toISOString()}] Job cancelled: ${err.message}`);
+      sendLog(clientIP, `[${new Date().toISOString()}] Job cancelled: ${err.message}`);
       res.status(499).json({ status: 'cancelled', error: 'Job was cancelled' });
     } else {
       res.status(500).json({ error: err?.message || String(err) });
@@ -189,8 +243,169 @@ app.post('/stop', (req, res) => {
   if (currentJob.browser) {
     currentJob.browser.close().catch(() => {});
   }
-  logEmitter.emit('log', `[${new Date().toISOString()}] Stop requested by user`);
+  const clientIP = sanitizeIP(getClientIP(req));
+  sendLog(clientIP, `[${new Date().toISOString()}] Stop requested by user`);
   res.json({ status: 'stopping', message: 'Download job will be stopped' });
+});
+
+// Download a single URL into the user's IP + idol folder
+// (Removed) /download-url endpoint
+
+// Download all images from a single post URL into the user's IP + idol folder
+app.post('/download-post', async (req, res) => {
+  const { idol, postUrl } = req.body || {};
+  if (!idol || !postUrl) {
+    return res.status(400).json({ error: 'idol and postUrl are required' });
+  }
+  try {
+    const clientIP = sanitizeIP(getClientIP(req));
+    const targetDir = path.join(downloadsDir, clientIP, String(idol));
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    // Launch a minimal Puppeteer instance (headless, Chromium in Docker)
+    const puppeteer = (await import('puppeteer')).default;
+    const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1365, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+    page.setDefaultNavigationTimeout(30000);
+
+    await page.goto(postUrl, { waitUntil: 'domcontentloaded' });
+
+    // Try to grab slider images first, fallback to content links
+    let images = await page.$$eval('.post-slider-item.open-gallery img', els => els.map(img => img.src));
+    if (!images || images.length === 0) {
+      images = await page.$$eval('.post-content a', els => els.map(a => a.href));
+    }
+
+    const imageCandidates = images.filter(u => /\.(jpg|jpeg|png|gif|webp|bmp|svg)(\?.*)?$/i.test(u));
+    const saved = [];
+    const skipped = [];
+    for (const imageUrl of imageCandidates) {
+      const rawName = decodeURIComponent((new URL(imageUrl)).pathname.split('/').pop() || 'file');
+      let filename = rawName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      let savePath = path.join(targetDir, filename);
+      if (fs.existsSync(savePath)) {
+        skipped.push(filename);
+        continue;
+      }
+      try {
+        const resp = await axios.get(imageUrl, { responseType: 'arraybuffer', headers: { Referer: postUrl, 'User-Agent': 'Mozilla/5.0' }, timeout: 60000 });
+        await fs.promises.writeFile(savePath, Buffer.from(resp.data));
+        saved.push(filename);
+        sendLog(clientIP, `[${new Date().toISOString()}] Saved from post: ${filename}`);
+      } catch (e) {
+        sendLog(clientIP, `[${new Date().toISOString()}] Failed to save ${filename}: ${e.message}`);
+      }
+    }
+
+    await page.close();
+    await browser.close();
+
+    return res.json({ status: 'completed', idol, postUrl, savedCount: saved.length, skippedCount: skipped.length, saved, skipped });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
+
+// Download images from a creator's pages (range) into the user's IP + creator folder
+app.post('/download-creator', async (req, res) => {
+  const { creator, start = 1, end = 1 } = req.body || {};
+  if (!creator) {
+    return res.status(400).json({ error: 'creator is required' });
+  }
+  const startPage = Math.max(1, parseInt(start));
+  const endPage = Math.max(startPage, parseInt(end));
+  try {
+    const clientIP = sanitizeIP(getClientIP(req));
+    const targetDir = path.join(downloadsDir, clientIP, String(creator));
+    fs.mkdirSync(targetDir, { recursive: true });
+
+    const puppeteer = (await import('puppeteer')).default;
+    const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+    const browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
+    });
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1365, height: 768 });
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+    page.setDefaultNavigationTimeout(60000);
+
+    let totalPostsProcessed = 0;
+    let totalSaved = 0;
+    for (let pageNumber = startPage; pageNumber <= endPage; pageNumber++) {
+      const pageUrl = pageNumber === 1
+        ? `https://idolfap.com/creator/${encodeURIComponent(creator)}/`
+        : `https://idolfap.com/creator/${encodeURIComponent(creator)}/page/${pageNumber}/`;
+      sendLog(clientIP, `[${new Date().toISOString()}] [Creator ${creator}] Opening page ${pageNumber}: ${pageUrl}`);
+      try {
+        await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+      } catch (navErr) {
+        sendLog(clientIP, `[${new Date().toISOString()}] Failed to open page ${pageNumber}: ${navErr.message}`);
+        continue;
+      }
+
+      const postLinks = await page.$$eval('body > div > main > div.grid.grid-show .post-image-wrapper > a', els => els.map(a => a.href));
+      if (!postLinks || postLinks.length === 0) {
+        sendLog(clientIP, `[${new Date().toISOString()}] No posts found on page ${pageNumber}.`);
+        continue;
+      }
+
+      sendLog(clientIP, `[${new Date().toISOString()}] Found ${postLinks.length} posts on page ${pageNumber}`);
+
+      for (const postLink of postLinks) {
+        totalPostsProcessed++;
+        const postPage = await browser.newPage();
+        try {
+          await postPage.goto(postLink, { waitUntil: 'domcontentloaded', timeout: 60000 });
+          let images = await postPage.$$eval('.post-slider-item.open-gallery img', els => els.map(img => img.src));
+          if (!images || images.length === 0) {
+            images = await postPage.$$eval('.post-content a', els => els.map(a => a.href));
+          }
+          const imageCandidates = images.filter(u => /(\.jpg|\.jpeg|\.png|\.gif|\.webp|\.bmp|\.svg)(\?.*)?$/i.test(u));
+          sendLog(clientIP, `[${new Date().toISOString()}] [Post ${totalPostsProcessed}] Images: ${imageCandidates.length} - ${postLink}`);
+          for (const imageUrl of imageCandidates) {
+            const raw = decodeURIComponent((new URL(imageUrl)).pathname.split('/').pop() || 'file');
+            const filename = raw.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const savePath = path.join(targetDir, filename);
+            try {
+              await fs.promises.access(savePath);
+              sendLog(clientIP, `[${new Date().toISOString()}] Skip exists: ${filename}`);
+              continue;
+            } catch {}
+            try {
+              const resp = await axios.get(imageUrl, { responseType: 'arraybuffer', headers: { Referer: postLink, 'User-Agent': 'Mozilla/5.0' }, timeout: 60000 });
+              await fs.promises.writeFile(savePath, Buffer.from(resp.data));
+              totalSaved++;
+              sendLog(clientIP, `[${new Date().toISOString()}] Saved: ${filename}`);
+            } catch (e) {
+              sendLog(clientIP, `[${new Date().toISOString()}] Failed ${filename}: ${e.message}`);
+            }
+          }
+        } catch (err) {
+          sendLog(clientIP, `[${new Date().toISOString()}] Error processing post ${totalPostsProcessed}: ${err.message}`);
+        } finally {
+          await postPage.close();
+        }
+      }
+    }
+
+    await page.close();
+    await browser.close();
+    return res.json({ status: 'completed', creator, start: startPage, end: endPage, postsProcessed: totalPostsProcessed, saved: totalSaved });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
 });
 
 app.listen(port, () => {

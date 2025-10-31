@@ -54,6 +54,9 @@
       const viewer = document.getElementById('viewer');
       const viewerContent = document.getElementById('viewerContent');
       let selectedIdol = null;
+      let currentOffset = 0;
+      let hasMore = false;
+      let isLoading = false;
 
       async function loadIdols() {
         try {
@@ -79,66 +82,138 @@
         }
       }
 
+      function createFileCard(file, idol, gallery) {
+        const col = document.createElement('div');
+        col.className = 'col';
+        const card = document.createElement('div');
+        card.className = 'card h-100 position-relative';
+        // File type badge
+        const ext = (file.name.split('.').pop() || '').toUpperCase();
+        const badge = document.createElement('span');
+        badge.className = 'badge bg-dark position-absolute top-0 start-0 m-2';
+        badge.textContent = ext;
+        card.appendChild(badge);
+        const isVideo = /\.(mp4|webm|ogg)$/i.test(file.name);
+        const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(file.name);
+        if (isVideo) {
+          const vid = document.createElement('video');
+          vid.className = 'card-img-top';
+          vid.loading = 'lazy';
+          vid.src = file.path;
+          vid.controls = true;
+          vid.muted = true;
+          vid.loop = true;
+          vid.playsInline = true;
+          vid.onclick = () => openViewer('video', file.path);
+          card.appendChild(vid);
+        } else if (isImage) {
+          const img = document.createElement('img');
+          img.className = 'card-img-top';
+          img.loading = 'lazy';
+          img.src = file.path;
+          img.alt = file.name;
+          img.onerror = () => { img.style.display = 'none'; };
+          img.onclick = () => openViewer('image', file.path);
+          card.appendChild(img);
+        }
+        const cardBody = document.createElement('div');
+        cardBody.className = 'card-body d-flex flex-column';
+        const name = document.createElement('div');
+        name.className = 'small text-truncate mb-1';
+        name.textContent = file.name;
+        cardBody.appendChild(name);
+        const size = document.createElement('div');
+        size.className = 'text-muted small mb-2';
+        size.textContent = formatSize(file.size);
+        cardBody.appendChild(size);
+        const download = document.createElement('a');
+        download.className = 'btn btn-success btn-sm mt-auto';
+        download.href = `/files/download/${idol}/${encodeURIComponent(file.name)}`;
+        download.download = file.name;
+        download.textContent = 'Download';
+        cardBody.appendChild(download);
+        card.appendChild(cardBody);
+        col.appendChild(card);
+        gallery.appendChild(col);
+        return col;
+      }
+
+      async function loadMoreFiles() {
+        if (isLoading || !hasMore || !selectedIdol) return;
+        isLoading = true;
+        const loadMoreBtn = document.getElementById('loadMoreBtn');
+        if (loadMoreBtn) loadMoreBtn.disabled = true;
+        try {
+          const res = await fetch(`/api/files/${selectedIdol}?limit=20&offset=${currentOffset}`);
+          const data = await res.json();
+          if (!data.files || data.files.length === 0) {
+            hasMore = false;
+            loadMoreBtn?.parentElement?.remove();
+            return;
+          }
+          const gallery = galleryContainer.querySelector('.row');
+          data.files.forEach(file => createFileCard(file, selectedIdol, gallery));
+          currentOffset += data.files.length;
+          hasMore = data.hasMore;
+          if (loadMoreBtn) {
+            if (!hasMore) {
+              loadMoreBtn.parentElement.remove();
+            } else {
+              loadMoreBtn.disabled = false;
+            }
+          }
+        } catch (err) {
+          console.error('Error loading more files:', err);
+          if (loadMoreBtn) loadMoreBtn.disabled = false;
+        } finally {
+          isLoading = false;
+        }
+      }
+
       async function selectIdol(idol) {
         selectedIdol = idol;
+        currentOffset = 0;
+        hasMore = false;
         document.querySelectorAll('.btn-outline-primary').forEach(btn => {
           btn.classList.toggle('active', btn.textContent === idol);
         });
         try {
-          const res = await fetch(`/api/files/${idol}`);
-          const files = await res.json();
-          if (files.length === 0) {
+          const res = await fetch(`/api/files/${idol}?limit=20&offset=0`);
+          const data = await res.json();
+          if (!data.files || data.files.length === 0) {
             galleryContainer.innerHTML = '<div class="alert alert-warning text-center">No files found for ' + idol + '</div>';
             return;
           }
-          galleryContainer.innerHTML = '<div class="row row-cols-2 row-cols-md-3 row-cols-lg-4 row-cols-xl-5 g-3"></div>';
-          const gallery = galleryContainer.querySelector('.row');
-          files.forEach(file => {
-            const col = document.createElement('div');
-            col.className = 'col';
-            const card = document.createElement('div');
-            card.className = 'card h-100';
-            const isVideo = /\.(mp4|webm|ogg)$/i.test(file.name);
-            const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(file.name);
-            if (isVideo) {
-              const vid = document.createElement('video');
-              vid.className = 'card-img-top';
-              vid.src = file.path;
-              vid.controls = true;
-              vid.muted = true;
-              vid.loop = true;
-              vid.playsInline = true;
-              vid.onclick = () => openViewer('video', file.path);
-              card.appendChild(vid);
-            } else if (isImage) {
-              const img = document.createElement('img');
-              img.className = 'card-img-top';
-              img.src = file.path;
-              img.alt = file.name;
-              img.onerror = () => { img.style.display = 'none'; };
-              img.onclick = () => openViewer('image', file.path);
-              card.appendChild(img);
-            }
-            const cardBody = document.createElement('div');
-            cardBody.className = 'card-body d-flex flex-column';
-            const name = document.createElement('div');
-            name.className = 'small text-truncate mb-1';
-            name.textContent = file.name;
-            cardBody.appendChild(name);
-            const size = document.createElement('div');
-            size.className = 'text-muted small mb-2';
-            size.textContent = formatSize(file.size);
-            cardBody.appendChild(size);
-            const download = document.createElement('a');
-            download.className = 'btn btn-success btn-sm mt-auto';
-            download.href = `/files/download/${idol}/${encodeURIComponent(file.name)}`;
-            download.download = file.name;
-            download.textContent = 'Download';
-            cardBody.appendChild(download);
-            card.appendChild(cardBody);
-            col.appendChild(card);
-            gallery.appendChild(col);
-          });
+          // Header with Download All button
+          const header = document.createElement('div');
+          header.className = 'd-flex justify-content-between align-items-center mb-3';
+          header.innerHTML = `<h5 class="mb-0">${idol}</h5>`;
+          const zipBtn = document.createElement('a');
+          zipBtn.className = 'btn btn-outline-success btn-sm';
+          zipBtn.href = `/files/download-zip/${encodeURIComponent(idol)}`;
+          zipBtn.textContent = 'Download All (ZIP)';
+          header.appendChild(zipBtn);
+
+          galleryContainer.innerHTML = '';
+          galleryContainer.appendChild(header);
+          const grid = document.createElement('div');
+          grid.className = 'row row-cols-2 row-cols-md-3 row-cols-lg-4 row-cols-xl-5 g-3';
+          galleryContainer.appendChild(grid);
+          const gallery = grid;
+          data.files.forEach(file => createFileCard(file, idol, gallery));
+          currentOffset = data.files.length;
+          hasMore = data.hasMore;
+          if (hasMore) {
+            const loadMoreDiv = document.createElement('div');
+            loadMoreDiv.className = 'text-center mt-4';
+            const loadMoreBtn = document.createElement('button');
+            loadMoreBtn.id = 'loadMoreBtn';
+            loadMoreBtn.className = 'btn btn-primary';
+            loadMoreBtn.textContent = 'Load More';
+            loadMoreBtn.onclick = loadMoreFiles;
+            loadMoreDiv.appendChild(loadMoreBtn);
+            galleryContainer.appendChild(loadMoreDiv);
+          }
         } catch (err) {
           galleryContainer.innerHTML = '<div class="alert alert-danger text-center">Error loading files: ' + err.message + '</div>';
         }
